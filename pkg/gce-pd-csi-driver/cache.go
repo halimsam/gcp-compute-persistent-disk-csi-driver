@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
+	fsnotify "github.com/fsnotify/fsnotify"
 
 	"k8s.io/klog/v2"
 
@@ -164,14 +165,15 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 	} else {
 		fastCacheSize := req.GetPublishContext()[common.ContexLocalSsdCacheSize]
 		chunkSize := "960" // Cannot use default chunk size(64KiB) as it errors on maxChunksAllowed. Unit - KiB
-		klog.V(2).Infof("============================== fastCacheSize is %v ==============================", fastCacheSize)
+		klog.V(2).Infof("============================== fastCacheSize is %v GiB ==============================", fastCacheSize)
 		klog.V(2).Infof("============================== lvcreate fast cache layer again with the VolumeGroup %v==============================", volumeGroupName)
 		args = []string{
 			"--yes",
 			"-n",
 			cacheLvName,
 			"-L",
-			fastCacheSize,
+			// ConvertGiStringToInt64 converts the input size to GiB so default to "g" for cache size - LVM g|G is GiB.
+			fastCacheSize + "g",
 			volumeGroupName,
 			raidedLocalSsdPath,
 		}
@@ -392,4 +394,42 @@ func isCachingSetup(mainLvName string) (error, bool) {
 		return nil, true
 	}
 	return nil, false
+}
+
+func StartWatcher(nodeName string) {
+	dirToWatch := "/dev/"
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		klog.V(2).ErrorS(err, "Errored while creating watcher")
+	}
+	defer watcher.Close()
+
+	// out of the box fsnotify can watch a single file, or a single directory
+	if err := watcher.Add(dirToWatch); err != nil {
+		klog.V(2).ErrorS(err, "Errored while adding watcher directory")
+	}
+	errorCh := make(chan error, 1)
+	// Handle the error received from the watcher goroutine
+	go WatchDiskDetaches(watcher, nodeName, errorCh)
+
+	select {
+	case err := <-errorCh:
+		klog.Errorf("Watcher encountered an error: %v", err)
+	}
+}
+
+func WatchDiskDetaches(watcher *fsnotify.Watcher, nodeName string, errorCh chan error) error {
+	for {
+		select {
+		// watch for errors
+		case err := <-watcher.Errors:
+			errorCh <- fmt.Errorf("Disk update event errored: %v", err)
+		// watch for events
+		case event := <-watcher.Events:
+			// In case of an event i.e. creation or deletion of any new PV, we update the VG metadata.
+			// This might include some non-LVM changes, no harm in updating metadata multiple times.
+			reduceVolumeGroup(getVolumeGroupName(nodeName), true)
+			klog.V(2).Infof("Disk attach/detach event %#v\n", event)
+		}
+	}
 }
