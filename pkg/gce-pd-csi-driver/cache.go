@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
+	fsnotify "github.com/fsnotify/fsnotify"
 
 	"k8s.io/klog/v2"
 
@@ -25,7 +26,7 @@ var raidedLocalSsdPath = raidedLssdPrefix + raidedLocalSsdName
 
 func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId string) (string, error) {
 	volumeId := req.GetVolumeId()
-	volumeGroupName := getVolumeGroupName(nodeId)
+	volumeGroupName := GetVolumeGroupName(nodeId)
 	mainDevicePath := "/dev/" + volumeGroupName + "/" + getLvName(mainLvSuffix, volumeId)
 	mainLvName := getLvName(mainLvSuffix, volumeId)
 	klog.V(2).Infof("Volume group available on node %v ", volumeGroupName)
@@ -36,17 +37,6 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 	}
 	infoString := strings.TrimSpace(string(info))
 	raidedLocalSsdPath = raidedLssdPrefix + infoString
-
-	vgExists := checkVgExists(volumeGroupName)
-	if vgExists {
-		// Clean up Volume Group before adding the PD
-		reduceVolumeGroup(volumeGroupName, true)
-	} else {
-		err := createVg(volumeGroupName, devicePath, raidedLocalSsdPath)
-		if err != nil {
-			return mainDevicePath, err
-		}
-	}
 
 	// Check if the Physical Volume(PV) is part of some other volume group
 	args := []string{
@@ -75,7 +65,7 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 			klog.Errorf("Errored while deactivating VG %v: err: %v: %s", vgNameForPv, err, info)
 		}
 		// CLean up volume group to remove any dangling PV refrences
-		reduceVolumeGroup(vgNameForPv, false)
+		ReduceVolumeGroup(vgNameForPv, false)
 		_, isCached := isCachingSetup(mainLvName)
 		// We will continue to uncache even if it errors to check caching as it is not a terminal issue.
 		if isCached {
@@ -91,7 +81,7 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 				return "", fmt.Errorf("errored while uncaching main LV. %v: %s", err, info)
 			}
 			// CLean up volume group to remove any dangling PV refrences
-			reduceVolumeGroup(vgNameForPv, false)
+			ReduceVolumeGroup(vgNameForPv, false)
 		}
 		info, err = common.RunCommand("" /* pipedCmd */, "" /* pipedCmdArg */, "vgmerge", []string{volumeGroupName, vgNameForPv}...)
 		if err != nil {
@@ -189,7 +179,7 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 	return mainDevicePath, nil
 }
 
-func checkVgExists(volumeGroupName string) bool {
+func CheckVgExists(volumeGroupName string) bool {
 	args := []string{}
 	info, err := common.RunCommand("" /* pipedCmd */, "" /* pipedCmdArg */, "vgscan", args...)
 	if err != nil {
@@ -202,8 +192,8 @@ func checkVgExists(volumeGroupName string) bool {
 
 func cleanupCache(volumeId string, nodeId string) error {
 
-	volumeGroupName := getVolumeGroupName(nodeId)
-	if !checkVgExists(volumeGroupName) {
+	volumeGroupName := GetVolumeGroupName(nodeId)
+	if !CheckVgExists(volumeGroupName) {
 		// If volume group doesn't exist then there's nothing to uncache
 		return nil
 	}
@@ -228,7 +218,7 @@ func cleanupCache(volumeId string, nodeId string) error {
 	return nil
 }
 
-func getVolumeGroupName(nodePath string) string {
+func GetVolumeGroupName(nodePath string) string {
 	nodeSlice := strings.Split(nodePath, "/")
 	nodeId := nodeSlice[len(nodeSlice)-1]
 	nodeHash := common.ShortString(nodeId)
@@ -241,7 +231,7 @@ func getLvName(suffix string, volumeId string) string {
 	return fmt.Sprintf("%s-%s", suffix, pvcName)
 }
 
-func createVg(volumeGroupName string, devicePath string, raidedLocalSsds string) error {
+func CreateVg(volumeGroupName string, raidedLocalSsds string) error {
 	args := []string{
 		"--zero",
 		"y",
@@ -263,7 +253,7 @@ func createVg(volumeGroupName string, devicePath string, raidedLocalSsds string)
 	return nil
 }
 
-func reduceVolumeGroup(volumeGroupName string, force bool) {
+func ReduceVolumeGroup(volumeGroupName string, force bool) {
 	args := []string{
 		"--removemissing",
 		volumeGroupName,
@@ -365,4 +355,66 @@ func isCachingSetup(mainLvName string) (error, bool) {
 		return nil, true
 	}
 	return nil, false
+}
+
+func StartWatcher(nodeName string) {
+	dirToWatch := "/dev/"
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		klog.V(2).ErrorS(err, "Errored while creating watcher")
+	}
+	defer watcher.Close()
+
+	// out of the box fsnotify can watch a single file, or a single directory
+	if err := watcher.Add(dirToWatch); err != nil {
+		klog.V(2).ErrorS(err, "Errored while adding watcher directory")
+	}
+	errorCh := make(chan error, 1)
+	// Handle the error received from the watcher goroutine
+	go watchDiskDetaches(watcher, nodeName, errorCh)
+
+	select {
+	case err := <-errorCh:
+		klog.Errorf("Watcher encountered an error: %v", err)
+	}
+}
+
+func watchDiskDetaches(watcher *fsnotify.Watcher, nodeName string, errorCh chan error) error {
+	for {
+		select {
+		// watch for errors
+		case err := <-watcher.Errors:
+			errorCh <- fmt.Errorf("Disk update event errored: %v", err)
+		// watch for events
+		case event := <-watcher.Events:
+			// In case of an event i.e. creation or deletion of any new PV, we update the VG metadata.
+			// This might include some non-LVM changes, no harm in updating metadata multiple times.
+			ReduceVolumeGroup(GetVolumeGroupName(nodeName), true)
+			klog.V(2).Infof("Disk attach/detach event %#v\n", event)
+		}
+	}
+}
+
+func ValidateRaidedLSSDinVG(vgName string) error {
+	args := []string{
+		"--noheadings",
+		"-o",
+		"pv_name",
+		"--select",
+		"vg_name=" + vgName,
+	}
+	info, err := common.RunCommand("" /* pipedCmd */, "" /* pipedCmdArg */, "pvs", args...)
+	if err != nil {
+		return fmt.Errorf("errored while checking physical volume details %v: %s", err, info)
+		// On error info contains the error message which we cannot use for further steps
+	}
+
+	klog.V(2).Infof("Got PVs %v in VG %v", strings.TrimSpace(string(info)), vgName)
+	if !strings.Contains(string(info), "/dev/md127") {
+		info, err := common.RunCommand("" /* pipedCmd */, "" /* pipedCmdArg */, "vgextend", []string{vgName, "/dev/md127"}...)
+		if err != nil {
+			klog.Errorf("Errored while extending VGs %v: %s", err, info)
+		}
+	}
+	return nil
 }
